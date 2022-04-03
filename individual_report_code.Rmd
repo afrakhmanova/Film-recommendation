@@ -1,0 +1,265 @@
+---
+title: "Индивидуальное задание по проекту"
+author: "Группа N23, afrakhmanova"
+output: 
+  html_document:
+    code_folding: hide
+    df_print: paged
+---
+
+
+### Задание 
+
+Индивидуальное задание звучит следующим образом:
+
+```{r message = FALSE, warning = FALSE, echo = F}
+library(R3PO)
+R3PO::get_hw_ind_questions(login = "afrakhmanova")
+```
+
+
+### Предыдущий код
+
+Для выполнения данного задания я бы хотела рассмотреть два варианта возможных рекомендаций. Один из них основан на рекомендациях, использованных в групповом отчете, а второй -- на логических решениях.
+
+Тогда из предыдущего кода мне понадобится только часть с датасетами.
+
+```{r message = FALSE, warning = FALSE, echo = F}
+library(tidyverse)
+library(tidyr)
+library(recommenderlab)
+
+load("~/shared/minor2_2020/data/good_read/books_g_5.RData")
+load("~/shared/minor2_2020/data/good_read/reviews_g_5.RData")
+```
+
+```{r message = FALSE, warning = FALSE, echo = F}
+recc_all = goodread_comics %>% 
+  select(title,  average_rating, ratings_count, publisher)
+recc_all$ratings_count = as.numeric(recc_all$ratings_count)
+recc_all$average_rating = as.numeric(recc_all$average_rating)
+recc_all = recc_all %>% 
+  filter(ratings_count >= quantile(recc_all$ratings_count, 0.25))
+recc_all = recc_all %>% 
+  arrange(desc(average_rating)) %>% 
+  select(title, average_rating, publisher) %>%
+  head(recc_all, n=10) 
+```
+
+
+### Решение
+
+#### Вариант 1
+
+Рекомендация строится аналогично привычному методу коллаборативной фильтрации. Разница и главная идея заключается в том, что оценки пользователя заменяются на противоположные по 5-балльной шкале методом вычитания по модулю. 
+
+В данных имеются нулевые оценки, которые могут олицетворять как хороший отзыв, так и плохой. А так как используемый метод основан только на оценках пользователя, стоит от таких избавиться. 
+
+Чтобы рекомендацию можно было сравнить со стандартной моделью, все изменения было решено оставить, как в групповом отчете: количество оценок, поставленных одним пользователем, больше 5, а количество оценок одного комикса при этом от 8 изначально. 
+
+```{r message = FALSE, warning = FALSE, echo = F}
+reviews = goodread_reviews
+reviews$rating = as.numeric(reviews$rating)
+reviews = reviews %>% filter(rating != 0)
+reviews$rating = abs(5-reviews$rating)
+
+counts1 = goodread_reviews %>% count(user_id) %>% arrange(-n)
+#unique(counts1$n)
+counts2 = goodread_reviews %>% count(book_id) %>% arrange(-n)
+#unique(counts2$n)
+
+ratings = select(reviews, book_id, user_id, rating)
+rates = pivot_wider(ratings, names_from = book_id, values_from = rating)
+userNames = rates$user_id
+rates = rates %>% select(-user_id)
+rownames(rates) = userNames
+
+rates = as.matrix(rates)
+r = as(rates, "realRatingMatrix")
+ratings_new = r[rowCounts(r) > 5]
+
+set.seed(23)
+test_ind = sample(1:nrow(ratings_new), size = nrow(ratings_new)*0.2)
+data_train = ratings_new[-test_ind, ]
+data_test = ratings_new[test_ind, ]
+```
+
+Так как метод коллаборатичной фильтрации делится на два метода, необходимо выбрать наилучший для получения адекватной рекомендации.
+
+Оценки методов IBCF и UBCF выглядят так:
+
+```{r message = FALSE, warning = FALSE, echo = F}
+set.seed(23)
+eval_sets = evaluationScheme(data = ratings_new, 
+                              method = "split",
+                              train = 0.8, # доля обучающей выборки
+                              given = 5, # сколько оценок используется для  предсказания
+                              goodRating = 4) # если предсказанная оценка < 4, то фильм не рекомендуем
+
+eval_model_IBCF = Recommender(data = getData(eval_sets, "train"), method = "IBCF")
+eval_predicted_IBCF = predict(object = eval_model_IBCF, newdata = getData(eval_sets, "known"), type = "ratings")
+
+eval_accuracy_IBCF = calcPredictionAccuracy(x = eval_predicted_IBCF,
+                                        data = getData(eval_sets, "unknown"),
+                                        byUser = F) # not averaging for each user
+eval_accuracy_IBCF
+
+eval_model_UBCF = Recommender(data = getData(eval_sets, "train"), method = "UBCF", parameter = list(nn = 5))
+eval_predicted_UBCF = predict(object = eval_model_UBCF, newdata = getData(eval_sets, "known"), type = "ratings")
+
+eval_accuracy_UBCF = calcPredictionAccuracy(x = eval_predicted_UBCF,
+                                         data = getData(eval_sets, "unknown"),
+                                         byUser = F) # not averaging for each user
+eval_accuracy_UBCF
+```
+
+IBCF рекомендует лучше, так как значение MAE ниже, хоть и не намного. Поэтому в дальнейшем будем использовать этот метод. 
+
+
+В итоге, сама рекомендация будет основана на наименьших оценках пользователя. То есть ему будут предложены комиксы, которые он еще не читал, но похожие на оцененные им на 1 или 2. 
+
+Вероятно, он может получить что-то сильно похожее на неинтересный для него комикс, что будет скорее плохой рекомендацией. А может, наоборот, получит что-то из той же "серии", но гораздо интереснее, что не стал бы читать сам. Тогда это рекомендация будет хорошей. (*Однако, зависит это все, конечно, от самого пользователя*)
+
+Если пользователь оценил менее 5 комиксов, то буквально любая рекомендация будет для него актуально новой. Поэтому, аналогично групповому проекту, он получит рекомендацию из 10 самых популярных комиксов по оценке и количеству отзывов (> 0.25 квантиль).
+
+```{r message = FALSE, warning = FALSE, echo = F}
+user = function(id){
+  user = goodread_reviews %>% 
+    filter(user_id == id) %>%
+    arrange(desc(rating)) %>% 
+    select(book_id, rating)
+  user = user %>% inner_join(goodread_comics, by = "book_id")
+  user = user %>%
+    arrange(desc(rating)) %>% 
+    select(title, rating, publisher) 
+  user
+}
+```
+
+```{r message = FALSE, warning = FALSE, echo = F}
+getCom = function(user_id, num = 5){
+  recc_model_IBCF = Recommender(data = data_train, method = "IBCF")
+  recc_predicted_IBCF = predict(object = recc_model_IBCF, newdata = data_test, n = num)
+
+  recc_user_IBCF = recc_predicted_IBCF@items[[user_id]]
+  books_user_IBCF = recc_predicted_IBCF@itemLabels[recc_user_IBCF]
+  names_books_user_IBCF = goodread_comics$title[match(books_user_IBCF, goodread_comics$book_id)]
+  books_user_IBCF = as.data.frame(books_user_IBCF, row.names = NULL)
+  books_user_IBCF$books_user_IBCF = as.numeric(books_user_IBCF$books_user_IBCF)
+  recc_info_IBCF = inner_join(x = books_user_IBCF, y = goodread_comics, by = c("books_user_IBCF"="book_id"))
+  recc_info_IBCF = recc_info_IBCF %>% 
+    arrange(desc(average_rating)) %>% 
+    select(title, average_rating, publisher) 
+  recc_info_IBCF
+
+  if (rlang::is_empty(names_books_user_IBCF) == T){
+  recc_all
+}
+  else {
+    recc_info_IBCF
+  }
+}
+```
+
+
+#### Вариант 2
+
+Метод основан больше на логике, нежели на работе рекомендательных систем.
+
+Суть заключается в том, что мы берем все оценки пользователя и удаляем из общих данных оцененные им комиксы. Кроме того, избавляемся от издателей этих же комиксов.
+
+Из оставшихся комиксов мы выбираем те, которые имеют достаточно большое количество оценок (> 0.25 квантиль) и располагаем в порядке убывания средних оценок. 
+Так как эта система не основна на привычных методах составления рекомендаций, а также дополнена смысловой нагрузкой, считаю возможным увеличить количество рекомендованных комиксов до 10 штук, полученных после фильтрации. 
+
+В данном случае кажется, что нет смысла фильтровать самих пользователей по количеству оцененных комиксов. Даже имея ровно одну оценку он вдруг может попросить "что-то новенькое", тогда по логике нужно делать все те же действия, чтобы избавиться от прямого сходства с уже проставленной оценкой. Однако рекомендация может быть на что-то похожее, например, от другого издателя, что может иметь как плюсы, так и минусы, описанные в первом варианте.
+
+```{r message = FALSE, warning = FALSE, echo = F}
+rec = function(id){
+  reviews = goodread_reviews
+  reviews = reviews %>% filter(user_id == id)
+  publisher = goodread_comics %>% inner_join(reviews, by = "book_id")
+  comics = goodread_comics %>% anti_join(publisher, by = "publisher")
+  recc = comics %>% 
+    select(title,  average_rating, ratings_count, publisher)
+  recc$ratings_count = as.numeric(recc$ratings_count)
+  recc$average_rating = as.numeric(recc$average_rating)
+  recc = recc %>% 
+    filter(ratings_count >= quantile(recc$ratings_count, 0.25))
+  recc = recc %>% 
+    arrange(desc(average_rating)) %>% 
+    select(title, average_rating, publisher) %>%
+    head(recc, n=10) 
+  recc
+}
+```
+
+
+
+### Примеры
+
+Для обоих вариантов рассмотрим два примера: пользователя со значительно большим количеством оцененных комиксов и пользователя с относительно маленьким количеством.
+
+**Вариант первый:**
+
+Пользователь "1d945500234cbc7a6138a4d017dbfe4b" оценил следующие комиксы:
+
+```{r message = FALSE, warning = FALSE, echo = F}
+user(id = "1d945500234cbc7a6138a4d017dbfe4b")
+```
+
+Вот что выдает рекомендация:
+
+```{r message = FALSE, warning = FALSE, echo = F}
+getCom(user_id = "1d945500234cbc7a6138a4d017dbfe4b")
+```
+
+Тут мы видим новых издателей, не оцененных ранее, а также новые категории. Однако, есть и некоторые сходства. С одной стороны, это хорошо -- рекомендованные комиксы могут понравиться пользователю из-за этих сходств. С другой стороны, наоборот, они могут быть слишком похожи, что для пользователя не окажется чем-то новым.
+
+Также можно проверить пользователя с малым количеством оцененных комиксов -- "6baf45d03466a5858403d892286ff222":
+
+```{r message = FALSE, warning = FALSE, echo = F}
+user(id = "6baf45d03466a5858403d892286ff222")
+```
+
+И вот его рекомендация: 
+
+```{r message = FALSE, warning = FALSE, echo = F}
+getCom(user_id = "6baf45d03466a5858403d892286ff222")
+```
+
+Ожидаемо, это самые популярные комиксы. Ведь он поставил слишком мало оценок.
+
+
+**Вариант второй:**
+
+Для начала изучим рекомендацию для первого пользователя -- "1d945500234cbc7a6138a4d017dbfe4b" -- с большим количеством оценок:
+
+```{r message = FALSE, warning = FALSE, echo = F}
+rec(id = "1d945500234cbc7a6138a4d017dbfe4b")
+```
+
+Очевидно, что тут не будет тех же издателей. Однако могут встретиться случаи, когда издатели отличаются одним словом, но по факту имеют один смысл, поэтому что-то похожее может встретиться, хоть и довольно редко. А вот категории могут пересекаться, но, скорее всего, с меньшей вероятностью, чем в первом варианте.
+
+Для другого пользователя -- "6baf45d03466a5858403d892286ff222" -- с меньшим количеством оценок система работает аналогично:
+
+```{r message = FALSE, warning = FALSE, echo = F}
+rec(id = "6baf45d03466a5858403d892286ff222")
+```
+
+Рекомендация из комиксов различных издателей и категорий, отличных от прочитанных -- то что нужно. Сравнивать более конкретно особо не с чем, так как пользователь оценил только один комикс, что слишком мало для анализа его вкусовых предпочтений.
+
+
+
+### Выводы
+
+Я рассмотрела два варианта решения поставленной задачи. К сожалению, в силу человеческих издержек, ни одна из них не может быть названа идеальной. Однако можно сказать, что обе системы работают довольно адекватно -- выдают что-то действительно новое и не сильно похожее, как в стандартных случаях с рекомендациями.
+
+Обобщим информацию:
+
+\> первая модель работает аналогично привычной нам системе коллаборативной фильтрации, однако основываясь при этом на низких оценках пользователя
+
+\> вторая модель основана на логике: чтобы выдать что-то новое, надо убрать все старое/схожее
+
+Таким образом, обе модели могут дать как хорошую, так и плохую рекомндацию, что может быть оценено скорее только самим пользователем или нами, но довольно субъективно. Связано это с тем, что в том и другом случае могут встретиться сходства с уже оцененными комиксами. Тогда эти сходства могут понравиться пользователю, как отголоски уже прочитанных, интересных ему комиксов. Но могут и не понравиться в силу того, что тогда рекомендация не такая уж и новая для него.
+
+Можно сказать, что обе идеи работают не совсем корректно. А точнее, сильно зависят от воли случая и реальных предпочтений пользователя.
